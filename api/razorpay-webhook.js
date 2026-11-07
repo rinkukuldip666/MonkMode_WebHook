@@ -1,76 +1,65 @@
-import crypto from 'crypto';
-import admin from 'firebase-admin';
+import admin from "firebase-admin";
 
 if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
   });
 }
 const db = admin.firestore();
 
-// TERA PLAN - ₹99 = 9900 paise me
-const EXPECTED_AMOUNT = 9900; 
-
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Only POST allowed' });
-  }
-  try {
-    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
-    const signature = req.headers['x-razorpay-signature'];
-    const body = JSON.stringify(req.body);
-    const expected = crypto.createHmac('sha256', secret).update(body).digest('hex');
-    if (signature !== expected) {
-      return res.status(400).json({ error: 'Invalid signature' });
-    }
+  if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
+  try {
     const event = req.body.event;
-    const sub = req.body.payload?.subscription?.entity;
     const payment = req.body.payload?.payment?.entity;
 
-    if (!sub) {
-      return res.status(200).json({ received: true });
+    if (!payment) return res.status(200).json({ received: true });
+
+    if (event !== "payment.captured") {
+      return res.status(200).json({ received: true, skipped: event });
     }
 
-    // --- NAYA LOCK 1: AMOUNT CHECK ---
-    // Agar payment aaya hai, to uska amount check karo
-    // Agar payment ₹99 (9900) ka nahi hai, to Pro MAT banao
-    if (event === 'subscription.charged' || event === 'subscription.activated') {
-      if (payment) {
-        // Payment fail hua to bhi Pro mat banao
-        if (payment.status !== 'captured' && payment.status !== 'authorized') {
-          console.log('Payment not captured, ignoring. Status:', payment.status);
-          return res.status(200).json({ received: true, reason: 'payment not captured' });
-        }
-        // Amount galat hai to Pro mat banao - YAHI ASLI FIX HAI
-        if (payment.amount !== EXPECTED_AMOUNT) {
-          console.log('Wrong amount:', payment.amount, 'Expected:', EXPECTED_AMOUNT);
-          return res.status(200).json({ received: true, reason: 'wrong amount' });
-        }
+    if (payment.status !== "captured") {
+      return res.status(200).json({ received: true, skipped: "not captured" });
+    }
+
+    if (payment.amount !== 9900) {
+      console.log("Wrong amount, ignored:", payment.amount);
+      return res.status(200).json({ received: true, skipped: "wrong amount" });
+    }
+
+    let userId = payment.notes?.userId || payment.notes?.uid || payment.notes?.firebaseUid || payment.notes?.user_id;
+
+    let userRef;
+    if (userId) {
+      userRef = db.collection("users").doc(userId);
+    } else if (payment.email) {
+      const snap = await db.collection("users").where("email", "==", payment.email).limit(1).get();
+      if (snap.empty) {
+        return res.status(200).json({ received: true, error: "user not found" });
       }
+      userRef = snap.docs[0].ref;
+    } else {
+      return res.status(200).json({ received: true, error: "no userId or email" });
     }
 
-    const usersRef = db.collection('users');
-    const snapshot = await usersRef.where('subscriptionId', '==', sub.id).get();
-    if (snapshot.empty) {
-      return res.status(200).json({ received: true });
-    }
+    const now = new Date();
+    const expiry = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-    let updateData = {};
-    if (event === 'subscription.activated' || event === 'subscription.charged') {
-      updateData = { isPro: true, proExpiry: sub.current_end_at, lastPaymentAt: admin.firestore.FieldValue.serverTimestamp() };
-    }
-    if (event === 'subscription.cancelled' || event === 'subscription.halted' || event === 'subscription.paused') {
-      updateData = { isPro: false };
-    }
+    await userRef.set({
+      isPro: true,
+      proExpiresAt: admin.firestore.Timestamp.fromDate(expiry),
+      lastPaymentId: payment.id,
+      lastPaymentAmount: payment.amount,
+      lastPaymentAt: admin.firestore.Timestamp.fromDate(now),
+      plan: "pro_30_days"
+    }, { merge: true });
 
-    for (const doc of snapshot.docs) {
-      await doc.ref.update(updateData);
-    }
-    return res.status(200).json({ received: true });
+    return res.status(200).json({ received: true, pro: true });
+
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e.message });
   }
-}
+        }
