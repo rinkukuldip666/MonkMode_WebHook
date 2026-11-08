@@ -1,65 +1,78 @@
-import admin from "firebase-admin";
+import crypto from 'crypto';
+import admin from 'firebase-admin';
+
+export const config = { api: { bodyParser: false } };
 
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
-  });
+  try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    console.log('✅ Firebase Admin Initialized');
+  } catch (error) {
+    console.error('❌ Firebase Init Error:', error.message);
+  }
 }
 const db = admin.firestore();
 
+async function getRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
-
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
   try {
-    const event = req.body.event;
-    const payment = req.body.payload?.payment?.entity;
+    const rawBody = await getRawBody(req);
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const signature = req.headers['x-razorpay-signature'];
 
-    if (!payment) return res.status(200).json({ received: true });
+    if (!secret) return res.status(500).json({ error: 'Server config error' });
 
-    if (event !== "payment.captured") {
-      return res.status(200).json({ received: true, skipped: event });
+    const expectedSignature = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    if (expectedSignature !== signature) {
+      console.error('❌ Signature Mismatch!');
+      return res.status(400).json({ error: 'Invalid Signature' });
     }
 
-    if (payment.status !== "captured") {
-      return res.status(200).json({ received: true, skipped: "not captured" });
-    }
+    const payload = JSON.parse(rawBody);
+    const event = payload.event;
+    console.log(`📩 Event: ${event}`);
 
-    if (payment.amount !== 9900) {
-      console.log("Wrong amount, ignored:", payment.amount);
-      return res.status(200).json({ received: true, skipped: "wrong amount" });
-    }
+    if (event === 'payment.captured') {
+      const payment = payload.payload?.payment?.entity;
+      if (!payment) return res.status(400).json({ error: 'Invalid Payload' });
 
-    let userId = payment.notes?.userId || payment.notes?.uid || payment.notes?.firebaseUid || payment.notes?.user_id;
+      const paymentId = payment.id;
+      const amountInRupees = (payment.amount || 0) / 100;
+      const userId = payment.notes?.userId;
+      const userEmail = payment.notes?.userEmail || payment.email || 'N/A';
+      const deviceId = payment.notes?.deviceId || 'UNKNOWN_DEVICE';
 
-    let userRef;
-    if (userId) {
-      userRef = db.collection("users").doc(userId);
-    } else if (payment.email) {
-      const snap = await db.collection("users").where("email", "==", payment.email).limit(1).get();
-      if (snap.empty) {
-        return res.status(200).json({ received: true, error: "user not found" });
+      console.log(`💳 Payment: ₹${amountInRupees}, User: ${userId}`);
+      if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+      // TEST KE LIYE >= 1 HAI - LIVE ME >= 99 KAR DENA
+      if (amountInRupees >= 1) {
+        const now = Date.now();
+        const expiresAt = now + 30 * 24 * 60 * 60 * 1000;
+        await db.collection('users').doc(userId).set({
+          userId: userId, deviceId: deviceId, email: userEmail,
+          isPremiumActive: true, premiumExpiresAt: expiresAt,
+          paymentStatus: 'SUCCESS', lastPaymentId: paymentId, lastUpdated: now
+        }, { merge: true });
+
+        await db.collection('payments').doc(paymentId).set({
+          paymentId: paymentId, userId: userId, deviceId: deviceId,
+          userEmail: userEmail, amountRupees: amountInRupees,
+          status: 'SUCCESS', provider: 'RAZORPAY_WEBHOOK', createdAtTimestamp: now
+        }, { merge: true });
+        console.log(`🎉 PRO ON for ${userId}`);
       }
-      userRef = snap.docs[0].ref;
-    } else {
-      return res.status(200).json({ received: true, error: "no userId or email" });
     }
-
-    const now = new Date();
-    const expiry = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-
-    await userRef.set({
-      isPro: true,
-      proExpiresAt: admin.firestore.Timestamp.fromDate(expiry),
-      lastPaymentId: payment.id,
-      lastPaymentAmount: payment.amount,
-      lastPaymentAt: admin.firestore.Timestamp.fromDate(now),
-      plan: "pro_30_days"
-    }, { merge: true });
-
-    return res.status(200).json({ received: true, pro: true });
-
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: e.message });
+    return res.status(200).json({ status: 'SUCCESS' });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: error.message });
   }
-        }
+}
