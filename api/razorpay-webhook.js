@@ -52,8 +52,8 @@ export default async function handler(req, res) {
       console.log(`💳 Payment: ₹${amountInRupees}, User: ${userId}`);
       if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
-      // TEST KE LIYE >= 1 HAI - LIVE ME >= 99 KAR DENA
-      if (amountInRupees >= 1) {
+      // LIVE PRICE - Sirf 99 ya usse zyada pe PRO ON hoga
+      if (amountInRupees >= 99) {
         const now = Date.now();
         const expiresAt = now + 30 * 24 * 60 * 60 * 1000;
         await db.collection('users').doc(userId).set({
@@ -75,4 +75,4 @@ export default async function handler(req, res) {
     console.error(error);
     return res.status(500).json({ error: error.message });
   }
-}
+    }
