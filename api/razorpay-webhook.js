@@ -8,9 +8,9 @@ if (!admin.apps.length) {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    console.log('✅ Firebase Admin Initialized');
+    console.log('✅ Firebase Admin Initialized Successfully');
   } catch (error) {
-    console.error('❌ Firebase Init Error:', error.message);
+    console.error('❌ Firebase Admin Init Error:', error.message);
   }
 }
 const db = admin.firestore();
@@ -28,22 +28,25 @@ export default async function handler(req, res) {
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
     const signature = req.headers['x-razorpay-signature'];
 
-    if (!secret) return res.status(500).json({ error: 'Server config error' });
+    if (!secret) {
+      console.error('❌ Server Config Error: RAZORPAY_WEBHOOK_SECRET is missing!');
+      return res.status(500).json({ error: 'Server config error: Webhook secret missing' });
+    }
 
-    // 2. HMAC SHA256 Signature Security Check
+    // 2. HMAC SHA256 Signature Security Verification
     const expectedSignature = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
     if (expectedSignature !== signature) {
-      console.error('❌ Signature Mismatch!');
+      console.error('❌ Signature Mismatch! Unauthorized request.');
       return res.status(400).json({ error: 'Invalid Signature' });
     }
 
     const payload = JSON.parse(rawBody);
     const event = payload.event;
-    console.log(`📩 Event: ${event}`);
+    console.log(`📩 Webhook Event Received: ${event}`);
 
     if (event === 'payment.captured') {
       const payment = payload.payload?.payment?.entity;
-      if (!payment) return res.status(400).json({ error: 'Invalid Payload' });
+      if (!payment) return res.status(400).json({ error: 'Invalid Payment Payload' });
 
       const paymentId = payment.id;
       const amountInRupees = (payment.amount || 0) / 100;
@@ -51,40 +54,52 @@ export default async function handler(req, res) {
       const userEmail = payment.notes?.userEmail || payment.email || 'N/A';
       const deviceId = payment.notes?.deviceId || 'UNKNOWN_DEVICE';
 
-      console.log(`💳 Payment Captured: ₹${amountInRupees}, User: ${userId}`);
-      if (!userId) return res.status(400).json({ error: 'Missing userId' });
+      console.log(`💳 Payment Captured: ₹${amountInRupees}, PaymentId: ${paymentId}, User: ${userId}`);
+      if (!userId) return res.status(400).json({ error: 'Missing userId in notes' });
 
-      // FIX 2: Duplicate Payment Check - Agar Razorpay 2 baar bhejega to yahi ruk jayega
+      // Duplicate Payment Deduplication Check
       const existingPay = await db.collection('payments').doc(paymentId).get();
       if (existingPay.exists) {
-        console.log(`ℹ️ Payment ${paymentId} already processed. Skipping.`);
+        console.log(`ℹ️ Payment ${paymentId} already processed. Skipping duplicate processing.`);
         return res.status(200).json({ status: 'ALREADY_PROCESSED' });
       }
 
-      // 3. LIVE PRICE CHECK (Sirf ₹99 ya usse zyada pe PRO ON hoga)
+      // 3. LIVE PRICE CHECK (Activates Pro for ₹99 or higher)
       if (amountInRupees >= 99) {
         const now = Date.now();
-        const expiresAt = now + 30 * 24 * 60 * 60 * 1000;
+        const expiresAt = now + 30 * 24 * 60 * 60 * 1000; // 30 Days
 
-        // A) Activate User Pro Pass in Firestore
+        // A) Activate User Pro Pass in Firestore (users collection)
         await db.collection('users').doc(userId).set({
-          userId: userId, uid: userId, deviceId: deviceId, email: userEmail,
-          isPremiumActive: true, planType: 'PRO_MONTHLY', premiumStartedAt: now,
-          premiumExpiresAt: expiresAt, paymentStatus: 'SUCCESS',
-          lastPaymentId: paymentId, lastUpdated: now
+          userId: userId,
+          uid: userId,
+          deviceId: deviceId,
+          email: userEmail,
+          isPremiumActive: true,
+          planType: 'PRO_MONTHLY',
+          premiumStartedAt: now,
+          premiumExpiresAt: expiresAt,
+          paymentStatus: 'SUCCESS',
+          lastPaymentId: paymentId,
+          lastUpdated: now
         }, { merge: true });
 
-        // B) Save Payment Log
+        // B) Save Verified Payment Log in Firestore (payments collection)
         await db.collection('payments').doc(paymentId).set({
-          paymentId: paymentId, userId: userId, deviceId: deviceId,
-          userEmail: userEmail, amountRupees: amountInRupees,
-          status: 'SUCCESS', provider: 'RAZORPAY_WEBHOOK',
-          createdAtTimestamp: now, expiresAtTimestamp: expiresAt
+          paymentId: paymentId,
+          userId: userId,
+          deviceId: deviceId,
+          userEmail: userEmail,
+          amountRupees: amountInRupees,
+          status: 'SUCCESS',
+          provider: 'RAZORPAY_WEBHOOK',
+          createdAtTimestamp: now,
+          expiresAtTimestamp: expiresAt
         }, { merge: true });
 
-        console.log(`🎉 PRO ON for ${userId}`);
+        console.log(`🎉 30-Day PRO Pass Activated for User: ${userId}`);
 
-        // C) IDEMPOTENCY CHECK: Duplicate crediting prevent karta hai
+        // C) IDEMPOTENCY CHECK: Prevent duplicate commission crediting
         const commDocId = `${paymentId}_COMM`;
         const commRef = db.collection('commissions').doc(commDocId);
         const commSnap = await commRef.get();
@@ -96,7 +111,7 @@ export default async function handler(req, res) {
             const referrerUid = userData?.referredBy;
             const payingDeviceId = userData?.deviceId || deviceId;
 
-            // ANTI-CHEAT 1: User cannot refer themselves!
+            // ANTI-CHEAT 1: User cannot refer themselves
             if (referrerUid && typeof referrerUid === 'string' && referrerUid.trim() !== '' && referrerUid !== userId) {
               const referrerRef = db.collection('users').doc(referrerUid);
               const referrerSnap = await referrerRef.get();
@@ -107,45 +122,63 @@ export default async function handler(req, res) {
 
                 // ANTI-CHEAT 2: User cannot refer another account on the SAME physical phone!
                 if (!referrerDeviceId || referrerDeviceId !== payingDeviceId) {
-                  // FIX 1: Flat ₹20 - 30% hataya, ab koi decimal nahi aayega
-                  const commissionAmount = 20;
 
-                  // Atomically increment Referrer Wallet
-                  await referrerRef.update({
+                  // DYNAMIC TIERED COMMISSION:
+                  // Normal User Referrer -> ₹15
+                  // Partner Referrer (isPartner === true) -> ₹30
+                  const isPartner = referrerData?.isPartner === true;
+                  const commissionAmount = isPartner ? 30 : 15;
+                  const commissionRateLabel = isPartner ? 'PARTNER_30' : 'NORMAL_15';
+
+                  const updates = {
                     walletBalance: admin.firestore.FieldValue.increment(commissionAmount),
                     totalEarnings: admin.firestore.FieldValue.increment(commissionAmount),
                     pendingPayout: admin.firestore.FieldValue.increment(commissionAmount),
                     totalReferralsCount: admin.firestore.FieldValue.increment(1)
-                  });
+                  };
 
-                  // Log commission audit transaction
+                  // If referrer is an Official Partner, ALSO increment totalProUsers count!
+                  if (isPartner) {
+                    updates.totalProUsers = admin.firestore.FieldValue.increment(1);
+                  }
+
+                  // Atomically increment Referrer Wallet & Partner Stats in Firestore
+                  await referrerRef.update(updates);
+
+                  // Log commission audit transaction record for auditing & idempotency
                   await commRef.set({
                     paymentId: paymentId,
                     referrerUid: referrerUid,
                     referredUserId: userId,
                     referredUserEmail: userEmail,
                     amountPaid: amountInRupees,
-                    commissionRate: 'FLAT_20',
+                    commissionRate: commissionRateLabel,
                     commissionAmount: commissionAmount,
+                    isPartnerReferral: isPartner,
                     status: 'CREDITED',
                     timestamp: now
                   }, { merge: true });
 
-                  console.log(`🎁 Referrer ${referrerUid} credited with ₹${commissionAmount} (Flat ₹20)`);
+                  console.log(`🎁 Referrer ${referrerUid} credited with ₹${commissionAmount} (${commissionRateLabel})`);
                 } else {
                   console.log(`🛡️ Anti-Cheat Triggered: Blocked referral commission on SAME device (${payingDeviceId})`);
                 }
               }
+            } else {
+              console.log(`ℹ️ User ${userId} was not referred by anyone. No commission needed.`);
             }
           }
         } else {
           console.log(`ℹ️ Commission for payment ${paymentId} already credited. Skipping duplicate.`);
         }
+      } else {
+        console.warn(`⚠️ Payment amount ₹${amountInRupees} is less than required ₹99. Pro activation skipped.`);
       }
     }
+
     return res.status(200).json({ status: 'SUCCESS' });
   } catch (error) {
-    console.error('❌ Webhook Error:', error);
+    console.error('❌ Webhook Processing Error:', error);
     return res.status(500).json({ error: error.message });
   }
 }
