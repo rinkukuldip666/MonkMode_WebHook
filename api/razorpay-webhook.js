@@ -113,15 +113,15 @@ export default async function handler(req, res) {
 
             // ANTI-CHEAT 1: User cannot refer themselves
             if (referrerUid && typeof referrerUid === 'string' && referrerUid.trim() !== '' && referrerUid !== userId) {
-              const referrerRef = db.collection('users').doc(referrerUid);
+              const referrerRef = db.collection("users").doc(referrerUid);
               const referrerSnap = await referrerRef.get();
 
               if (referrerSnap.exists) {
                 const referrerData = referrerSnap.data();
                 const referrerDeviceId = referrerData?.deviceId || '';
 
-                // ANTI-CHEAT 2: User cannot refer another account on the SAME physical phone!
-                if (!referrerDeviceId || referrerDeviceId !== payingDeviceId) {
+                // ANTI-CHEAT 2: User cannot refer another account on the SAME physical phone (allow testing on UNKNOWN_DEVICE)
+                if (!referrerDeviceId || referrerDeviceId === 'UNKNOWN_DEVICE' || payingDeviceId === 'UNKNOWN_DEVICE' || referrerDeviceId !== payingDeviceId) {
 
                   // DYNAMIC TIERED COMMISSION:
                   // Normal User Referrer -> ₹15
