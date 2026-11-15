@@ -69,6 +69,11 @@ export default async function handler(req, res) {
         const now = Date.now();
         const expiresAt = now + 30 * 24 * 60 * 60 * 1000; // 30 Days
 
+        // Pehle user ka purana data check karo - taaki pata chale ye pehli baar pay kar raha hai ya dobara
+        const userDocBefore = await db.collection('users').doc(userId).get();
+        const userDataBefore = userDocBefore.exists ? userDocBefore.data() : {};
+        const isFirstPaidPayment = userDataBefore?.hasPaidBefore !== true;
+
         // A) Activate User Pro Pass in Firestore (users collection)
         await db.collection('users').doc(userId).set({
           userId: userId,
@@ -81,7 +86,9 @@ export default async function handler(req, res) {
           premiumExpiresAt: expiresAt,
           paymentStatus: 'SUCCESS',
           lastPaymentId: paymentId,
-          lastUpdated: now
+          lastUpdated: now,
+          hasPaidBefore: true, // FIX 2: Ab ye user dobara first-time nahi rahega
+          totalPaidCount: admin.firestore.FieldValue.increment(1)
         }, { merge: true });
 
         // B) Save Verified Payment Log in Firestore (payments collection)
@@ -94,82 +101,84 @@ export default async function handler(req, res) {
           status: 'SUCCESS',
           provider: 'RAZORPAY_WEBHOOK',
           createdAtTimestamp: now,
-          expiresAtTimestamp: expiresAt
+          expiresAtTimestamp: expiresAt,
+          isFirstPaidPayment: isFirstPaidPayment
         }, { merge: true });
 
-        console.log(`🎉 30-Day PRO Pass Activated for User: ${userId}`);
+        console.log(`🎉 30-Day PRO Pass Activated for User: ${userId} | First Payment: ${isFirstPaidPayment}`);
 
         // C) IDEMPOTENCY CHECK: Prevent duplicate commission crediting
-        const commDocId = `${paymentId}_COMM`;
-        const commRef = db.collection('commissions').doc(commDocId);
-        const commSnap = await commRef.get();
+        // Sirf tabhi commission do jab ye PEHLI BAAR pay kar raha hai
+        if (isFirstPaidPayment) {
+          const commDocId = `${paymentId}_COMM`;
+          const commRef = db.collection('commissions').doc(commDocId);
+          const commSnap = await commRef.get();
 
-        if (!commSnap.exists) {
-          const userDoc = await db.collection('users').doc(userId).get();
-          if (userDoc.exists) {
-            const userData = userDoc.data();
-            const referrerUid = userData?.referredBy;
-            const payingDeviceId = userData?.deviceId || deviceId;
+          if (!commSnap.exists) {
+            const userDoc = await db.collection('users').doc(userId).get();
+            if (userDoc.exists) {
+              const userData = userDoc.data();
+              const referrerUid = userData?.referredBy;
+              const payingDeviceId = userData?.deviceId || deviceId;
 
-            // ANTI-CHEAT 1: User cannot refer themselves
-            if (referrerUid && typeof referrerUid === 'string' && referrerUid.trim() !== '' && referrerUid !== userId) {
-              const referrerRef = db.collection("users").doc(referrerUid);
-              const referrerSnap = await referrerRef.get();
+              // ANTI-CHEAT 1: User cannot refer themselves
+              if (referrerUid && typeof referrerUid === 'string' && referrerUid.trim() !== '' && referrerUid !== userId) {
+                const referrerRef = db.collection("users").doc(referrerUid);
+                const referrerSnap = await referrerRef.get();
 
-              if (referrerSnap.exists) {
-                const referrerData = referrerSnap.data();
-                const referrerDeviceId = referrerData?.deviceId || '';
+                if (referrerSnap.exists) {
+                  const referrerData = referrerSnap.data();
+                  const referrerDeviceId = referrerData?.deviceId || '';
 
-                // ANTI-CHEAT 2: User cannot refer another account on the SAME physical phone (allow testing on UNKNOWN_DEVICE)
-                if (!referrerDeviceId || referrerDeviceId === 'UNKNOWN_DEVICE' || payingDeviceId === 'UNKNOWN_DEVICE' || referrerDeviceId !== payingDeviceId) {
+                  // ANTI-CHEAT 2: User cannot refer another account on the SAME physical phone
+                  if (!referrerDeviceId || referrerDeviceId === 'UNKNOWN_DEVICE' || payingDeviceId === 'UNKNOWN_DEVICE' || referrerDeviceId !== payingDeviceId) {
 
-                  // DYNAMIC TIERED COMMISSION:
-                  // Normal User Referrer -> ₹15
-                  // Partner Referrer (isPartner === true) -> ₹30
-                  const isPartner = referrerData?.isPartner === true;
-                  const commissionAmount = isPartner ? 30 : 15;
-                  const commissionRateLabel = isPartner ? 'PARTNER_30' : 'NORMAL_15';
+                    // DYNAMIC TIERED COMMISSION:
+                    // Normal User Referrer -> ₹15
+                    // Partner Referrer (isPartner === true) -> ₹30
+                    const isPartner = referrerData?.isPartner === true;
+                    const commissionAmount = isPartner ? 30 : 15;
+                    const commissionRateLabel = isPartner ? 'PARTNER_30' : 'NORMAL_15';
 
-                  const updates = {
-                    walletBalance: admin.firestore.FieldValue.increment(commissionAmount),
-                    totalEarnings: admin.firestore.FieldValue.increment(commissionAmount),
-                    pendingPayout: admin.firestore.FieldValue.increment(commissionAmount),
-                    totalReferralsCount: admin.firestore.FieldValue.increment(1)
-                  };
+                    // FIX 1 & 3: pendingPayout HATA DIYA, totalProUsers SABKE LIYE kar diya
+                    const updates = {
+                      walletBalance: admin.firestore.FieldValue.increment(commissionAmount),
+                      totalEarnings: admin.firestore.FieldValue.increment(commissionAmount),
+                      totalReferralsCount: admin.firestore.FieldValue.increment(1),
+                      totalProUsers: admin.firestore.FieldValue.increment(1)
+                    };
 
-                  // If referrer is an Official Partner, ALSO increment totalProUsers count!
-                  if (isPartner) {
-                    updates.totalProUsers = admin.firestore.FieldValue.increment(1);
+                    // Atomically increment Referrer Wallet & Partner Stats
+                    await referrerRef.update(updates);
+
+                    // Log commission audit transaction record
+                    await commRef.set({
+                      paymentId: paymentId,
+                      referrerUid: referrerUid,
+                      referredUserId: userId,
+                      referredUserEmail: userEmail,
+                      amountPaid: amountInRupees,
+                      commissionRate: commissionRateLabel,
+                      commissionAmount: commissionAmount,
+                      isPartnerReferral: isPartner,
+                      status: 'CREDITED',
+                      timestamp: now
+                    }, { merge: true });
+
+                    console.log(`🎁 Referrer ${referrerUid} credited with ₹${commissionAmount} (${commissionRateLabel})`);
+                  } else {
+                    console.log(`🛡️ Anti-Cheat Triggered: Blocked referral commission on SAME device (${payingDeviceId})`);
                   }
-
-                  // Atomically increment Referrer Wallet & Partner Stats in Firestore
-                  await referrerRef.update(updates);
-
-                  // Log commission audit transaction record for auditing & idempotency
-                  await commRef.set({
-                    paymentId: paymentId,
-                    referrerUid: referrerUid,
-                    referredUserId: userId,
-                    referredUserEmail: userEmail,
-                    amountPaid: amountInRupees,
-                    commissionRate: commissionRateLabel,
-                    commissionAmount: commissionAmount,
-                    isPartnerReferral: isPartner,
-                    status: 'CREDITED',
-                    timestamp: now
-                  }, { merge: true });
-
-                  console.log(`🎁 Referrer ${referrerUid} credited with ₹${commissionAmount} (${commissionRateLabel})`);
-                } else {
-                  console.log(`🛡️ Anti-Cheat Triggered: Blocked referral commission on SAME device (${payingDeviceId})`);
                 }
+              } else {
+                console.log(`ℹ️ User ${userId} was not referred by anyone. No commission needed.`);
               }
-            } else {
-              console.log(`ℹ️ User ${userId} was not referred by anyone. No commission needed.`);
             }
+          } else {
+            console.log(`ℹ️ Commission for payment ${paymentId} already credited. Skipping duplicate.`);
           }
         } else {
-          console.log(`ℹ️ Commission for payment ${paymentId} already credited. Skipping duplicate.`);
+          console.log(`ℹ️ User ${userId} is renewing PRO. No commission for renewal.`);
         }
       } else {
         console.warn(`⚠️ Payment amount ₹${amountInRupees} is less than required ₹99. Pro activation skipped.`);
