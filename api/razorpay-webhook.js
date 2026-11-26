@@ -8,9 +8,9 @@ if (!admin.apps.length) {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    console.log('✅ Firebase Admin Initialized Successfully');
+    console.log('âœ… Firebase Admin Initialized Successfully');
   } catch (error) {
-    console.error('❌ Firebase Admin Init Error:', error.message);
+    console.error('âŒ Firebase Admin Init Error:', error.message);
   }
 }
 const db = admin.firestore();
@@ -23,70 +23,75 @@ async function getRawBody(req) {
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
+
   try {
     const rawBody = await getRawBody(req);
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
     const signature = req.headers['x-razorpay-signature'];
 
     if (!secret) {
-      console.error('❌ Server Config Error: RAZORPAY_WEBHOOK_SECRET is missing!');
+      console.error('âŒ Server Config Error: RAZORPAY_WEBHOOK_SECRET is missing!');
       return res.status(500).json({ error: 'Server config error: Webhook secret missing' });
     }
 
     // 2. HMAC SHA256 Signature Security Verification
     const expectedSignature = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
     if (expectedSignature !== signature) {
-      console.error('❌ Signature Mismatch! Unauthorized request.');
+      console.error('âŒ Signature Mismatch! Unauthorized request.');
       return res.status(400).json({ error: 'Invalid Signature' });
     }
 
     const payload = JSON.parse(rawBody);
     const event = payload.event;
-    console.log(`📩 Webhook Event Received: ${event}`);
+    console.log(`ðŸ“© Webhook Event Received: ${event}`);
 
     if (event === 'payment.captured') {
       const payment = payload.payload?.payment?.entity;
       if (!payment) return res.status(400).json({ error: 'Invalid Payment Payload' });
 
       const paymentId = payment.id;
-      const amountInRupees = (payment.amount || 0) / 100;
+      const amountInRupees = (payment.amount || 0) / 100; // Razorpay sends amount in paise
       const userId = payment.notes?.userId || payment.notes?.buyerUid;
       const userEmail = payment.notes?.userEmail || payment.email || 'N/A';
       const deviceId = payment.notes?.deviceId || 'UNKNOWN_DEVICE';
-      const referCodeUsed = payment.notes?.referCode || '';
 
-      console.log(`💳 Payment Captured: ₹${amountInRupees}, PaymentId: ${paymentId}, User: ${userId}`);
-      if (!userId) return res.status(400).json({ error: 'Missing userId in notes' });
+      console.log(`ðŸ’³ Payment Captured: â‚¹${amountInRupees}, PaymentId: ${paymentId}, User: ${userId}`);
 
-      // Duplicate Payment Deduplication Check
+      if (!userId) {
+        console.error('âŒ Missing userId in payment notes!');
+        return res.status(400).json({ error: 'Missing userId in notes' });
+      }
+
+      // 3. Duplicate Payment Deduplication Check
       const existingPay = await db.collection('payments').doc(paymentId).get();
       if (existingPay.exists) {
-        console.log(`ℹ️ Payment ${paymentId} already processed. Skipping duplicate processing.`);
+        console.log(`â„¹ï¸ Payment ${paymentId} already processed. Skipping duplicate processing.`);
         return res.status(200).json({ status: 'ALREADY_PROCESSED' });
       }
 
-      // 3. LIVE PRICE CHECK (Activates Pro for ₹99 or higher)
-      if (amountInRupees >= 99) {
+      // 4. LIVE PRICE CHECK (Activates 30-Day PRO for â‚¹49 or higher)
+      if (amountInRupees >= 49) {
         const now = Date.now();
-        const expiresAt = now + 30 * 24 * 60 * 60 * 1000; // 30 Days
+        const expiresAt = now + (30 * 24 * 60 * 60 * 1000); // 30 Days in Milliseconds
 
         const userDocBefore = await db.collection('users').doc(userId).get();
         const userDataBefore = userDocBefore.exists ? userDocBefore.data() : {};
         const isFirstPaidPayment = userDataBefore?.hasPaidBefore !== true;
 
-        // A) Activate User Pro Pass in Firestore (users collection)
+        // A) Activate User PRO Status & Expiry in Firestore (users collection)
         await db.collection('users').doc(userId).set({
           userId: userId,
           uid: userId,
           deviceId: deviceId,
           email: userEmail,
-          isPro: true,             // FIX 1: App reads 'isPro'
-          isPremiumActive: true,   // FIX 1: Backup field
+          isPro: true,                          // App reads 'isPro'
+          proExpiryTimestamp: expiresAt,       // 30-Day Expiry Timestamp (Used by App)
+          premiumExpiresAt: expiresAt,         // Backup Expiry field
           planType: 'PRO_MONTHLY',
           premiumStartedAt: now,
-          premiumExpiresAt: expiresAt,
           paymentStatus: 'SUCCESS',
           lastPaymentId: paymentId,
+          lastPaymentAmount: amountInRupees,
           lastUpdated: now,
           hasPaidBefore: true,
           totalPaidCount: admin.firestore.FieldValue.increment(1)
@@ -106,93 +111,15 @@ export default async function handler(req, res) {
           isFirstPaidPayment: isFirstPaidPayment
         }, { merge: true });
 
-        console.log(`🎉 30-Day PRO Pass Activated for User: ${userId} | First Payment: ${isFirstPaidPayment}`);
-
-        // C) IDEMPOTENCY CHECK & REFERRAL COMMISSION
-        if (isFirstPaidPayment) {
-          const commDocId = `${paymentId}_COMM`;
-          const commRef = db.collection('commissions').doc(commDocId);
-          const commSnap = await commRef.get();
-
-          if (!commSnap.exists) {
-            let referrerUid = userDataBefore?.referredBy;
-
-            // FIX 2: If referCode was passed in payment notes, resolve referrerUid from referralCodes collection
-            if (!referrerUid && referCodeUsed) {
-              const codeDoc = await db.collection('referralCodes').doc(referCodeUsed.trim().uppercase()).get();
-              if (codeDoc.exists) {
-                referrerUid = codeDoc.data()?.ownerUid;
-              }
-            }
-
-            const payingDeviceId = userDataBefore?.deviceId || deviceId;
-
-            // ANTI-CHEAT 1: User cannot refer themselves
-            if (referrerUid && typeof referrerUid === 'string' && referrerUid.trim() !== '' && referrerUid !== userId) {
-              const referrerRef = db.collection("users").doc(referrerUid);
-              const referrerSnap = await referrerRef.get();
-
-              if (referrerSnap.exists) {
-                const referrerData = referrerSnap.data();
-                const referrerDeviceId = referrerData?.deviceId || '';
-
-                // ANTI-CHEAT 2: User cannot refer another account on SAME physical phone
-                if (!referrerDeviceId || referrerDeviceId === 'UNKNOWN_DEVICE' || payingDeviceId === 'UNKNOWN_DEVICE' || referrerDeviceId !== payingDeviceId) {
-
-                  // DYNAMIC TIERED COMMISSION:
-                  // Normal User Referrer -> ₹15
-                  // Partner Referrer (role === 'partner' OR isPartner === true) -> ₹30
-                  const isPartner = referrerData?.role === 'partner' || referrerData?.isPartner === true;
-                  val commissionAmount = isPartner ? 30 : 15;
-                  val commissionRateLabel = isPartner ? 'PARTNER_30' : 'NORMAL_15';
-
-                  const updates = {
-                    walletBalance: admin.firestore.FieldValue.increment(commissionAmount),
-                    totalEarning: admin.firestore.FieldValue.increment(commissionAmount),
-                    totalEarnings: admin.firestore.FieldValue.increment(commissionAmount),
-                    totalReferralsCount: admin.firestore.FieldValue.increment(1),
-                    totalProUsers: admin.firestore.FieldValue.increment(1)
-                  };
-
-                  // Atomically increment Referrer Wallet & Partner Stats
-                  await referrerRef.update(updates);
-
-                  // Log commission audit transaction record
-                  await commRef.set({
-                    paymentId: paymentId,
-                    referrerUid: referrerUid,
-                    referredUserId: userId,
-                    referredUserEmail: userEmail,
-                    amountPaid: amountInRupees,
-                    commissionRate: commissionRateLabel,
-                    commissionAmount: commissionAmount,
-                    isPartnerReferral: isPartner,
-                    status: 'CREDITED',
-                    timestamp: now
-                  }, { merge: true });
-
-                  console.log(`🎁 Referrer ${referrerUid} credited with ₹${commissionAmount} (${commissionRateLabel})`);
-                } else {
-                  console.log(`🛡️ Anti-Cheat Triggered: Blocked referral commission on SAME device (${payingDeviceId})`);
-                }
-              }
-            } else {
-              console.log(`ℹ️ User ${userId} was not referred by anyone. No commission needed.`);
-            }
-          } else {
-            console.log(`ℹ️ Commission for payment ${paymentId} already credited. Skipping duplicate.`);
-          }
-        } else {
-          console.log(`ℹ️ User ${userId} is renewing PRO. No commission for renewal.`);
-        }
+        console.log(`ðŸŽ‰ 30-Day PRO Pass Activated for User: ${userId} (UID) | Amount: â‚¹${amountInRupees} | Expires At: ${new Date(expiresAt).toISOString()}`);
       } else {
-        console.warn(`⚠️ Payment amount ₹${amountInRupees} is less than required ₹99. Pro activation skipped.`);
+        console.warn(`âš ï¸ Payment amount â‚¹${amountInRupees} is less than required â‚¹49. PRO activation skipped.`);
       }
     }
 
     return res.status(200).json({ status: 'SUCCESS' });
   } catch (error) {
-    console.error('❌ Webhook Processing Error:', error);
+    console.error('âŒ Webhook Processing Error:', error);
     return res.status(500).json({ error: error.message });
   }
-}
+        }
